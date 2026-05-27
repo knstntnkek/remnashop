@@ -1,4 +1,4 @@
-name: Remnashop - Release
+name: Remnashop - Release test
 
 on:
   release:
