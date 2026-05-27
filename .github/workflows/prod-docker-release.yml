@@ -51,8 +51,8 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/snoups/remnashop:latest
-            ghcr.io/snoups/remnashop:${{ github.ref_name }}
+            ghcr.io/knstntnkek/remnashop:latest
+            ghcr.io/knstntnkek/remnashop:${{ github.ref_name }}
           build-args: |
             BUILD_TIME=${{ steps.vars.outputs.build_time }}
             BUILD_BRANCH=main
@@ -82,12 +82,12 @@ jobs:
 
             ### Latest:
             ```
-            ghcr.io/snoups/remnashop:latest
+            ghcr.io/knstntnkek/remnashop:latest
             ```
 
             ### Versioned:
             ```
-            ghcr.io/snoups/remnashop:${{ github.ref_name }}
+            ghcr.io/knstntnkek/remnashop:${{ github.ref_name }}
             ```
           draft: false
           prerelease: false
