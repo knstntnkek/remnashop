@@ -1,6 +1,5 @@
 import hashlib
 import hmac
-import uuid
 from decimal import Decimal
 from typing import Any, Final
 from uuid import UUID
@@ -19,18 +18,24 @@ from src.core.enums import TransactionStatus
 from .base import BasePaymentGateway
 
 
-# https://tribute.tg/  (Tribute Merchant API)
-#
-# NOTE: Tribute exposes a REST API for creating digital-product / donation orders
-# and forwards payment notifications via signed webhooks. Endpoint paths and the
-# exact signature header name should be verified against the merchant's Tribute
-# dashboard / API documentation. The integration scaffolding (settings, DI,
-# webhook routing) is fully wired and matches the bot's gateway contract.
+# Tribute Shop API:
+#   docs:           https://wiki.tribute.tg/for-shops/api
+#   methods:        https://wiki.tribute.tg/for-shops/api/methods
+#   webhooks:       https://wiki.tribute.tg/for-shops/api/webhooks
+#   webhook auth:   trbt-signature = HMAC-SHA256(raw_body, key=api_key)
 class TributeGateway(BasePaymentGateway):
     _client: AsyncClient
 
     API_BASE: Final[str] = "https://tribute.tg/api/v1"
     SIGNATURE_HEADER: Final[str] = "trbt-signature"
+
+    # Tribute amounts are expressed in the smallest currency unit
+    # (kopecks for RUB, cents for EUR/USD).
+    _MINOR_UNITS_PER_MAJOR: Final[int] = 100
+
+    # Tribute string field limits (UTF-16 code units, see Methods docs).
+    _NAME_MAX_LEN: Final[int] = 100
+    _DESCRIPTION_MAX_LEN: Final[int] = 300
 
     def __init__(self, gateway: PaymentGatewayDto, bot: Bot, config: AppConfig) -> None:
         super().__init__(gateway, bot, config)
@@ -50,15 +55,14 @@ class TributeGateway(BasePaymentGateway):
         )
 
     async def handle_create_payment(self, amount: Decimal, details: str) -> PaymentResultDto:
-        order_id = str(uuid.uuid4())
-        payload = await self._create_payment_payload(amount, details, order_id)
+        payload = await self._create_payment_payload(amount, details)
         logger.debug(f"Creating payment payload: {payload}")
 
         try:
-            response = await self._client.post("/orders", json=payload)
+            response = await self._client.post("/shop/orders", json=payload)
             response.raise_for_status()
             data = orjson.loads(response.content)
-            return self._get_payment_data(data, order_id)
+            return self._get_payment_data(data)
 
         except HTTPStatusError as e:
             logger.error(
@@ -83,33 +87,37 @@ class TributeGateway(BasePaymentGateway):
 
         webhook_data = orjson.loads(raw_body)
 
-        # Tribute wraps payload under "payload" with an event "name"; we accept
-        # either flat or wrapped shape to be tolerant of API variations.
-        event_name = webhook_data.get("name") or webhook_data.get("event")
-        payload: dict = webhook_data.get("payload", webhook_data)
+        event_name = webhook_data.get("name", "")
+        payload: dict = webhook_data.get("payload") or {}
 
-        order_id_str = (
-            payload.get("order_id")
-            or payload.get("external_id")
-            or payload.get("orderId")
-        )
-        if not order_id_str:
-            raise ValueError("Required field 'order_id' is missing in Tribute webhook")
+        # 'shop_order_payment_received' is an intermediate signal — funds have
+        # not been credited yet. The terminal event for one-time orders is
+        # 'shop_order' (with status=paid|failed).
+        if event_name == "shop_order_payment_received":
+            raise ValueError("Intermediate event 'shop_order_payment_received' ignored")
+
+        order_uuid_str = payload.get("uuid")
+        if not order_uuid_str:
+            raise ValueError("Required field 'payload.uuid' is missing in Tribute webhook")
 
         try:
-            payment_id = UUID(order_id_str)
+            payment_id = UUID(order_uuid_str)
         except ValueError as e:
-            raise ValueError(f"Invalid order_id UUID: '{order_id_str}'") from e
+            raise ValueError(f"Invalid order uuid: '{order_uuid_str}'") from e
 
-        status = (payload.get("status") or event_name or "").lower()
+        order_status = (payload.get("status") or "").lower()
 
-        match status:
-            case "paid" | "succeeded" | "completed" | "new_payment":
-                transaction_status = TransactionStatus.COMPLETED
-            case "canceled" | "cancelled" | "expired" | "failed" | "declined":
-                transaction_status = TransactionStatus.CANCELED
-            case _:
-                raise ValueError(f"Unsupported Tribute event/status: '{status}'")
+        if event_name == "shop_order" and order_status == "paid":
+            transaction_status = TransactionStatus.COMPLETED
+        elif event_name in {
+            "shop_order_payment_failed",
+            "shop_order_cancelled",
+        } or order_status in {"failed", "cancelled", "canceled"}:
+            transaction_status = TransactionStatus.CANCELED
+        else:
+            raise ValueError(
+                f"Unsupported Tribute event '{event_name}' with status '{order_status}'"
+            )
 
         return payment_id, transaction_status
 
@@ -117,46 +125,40 @@ class TributeGateway(BasePaymentGateway):
         self,
         amount: Decimal,
         details: str,
-        order_id: str,
     ) -> dict[str, Any]:
         redirect_url = await self._get_bot_redirect_url()
+        minor_amount = int((amount * self._MINOR_UNITS_PER_MAJOR).to_integral_value())
         return {
-            "order_id": order_id,
-            "amount": float(amount),
-            "currency": self.data.currency.value,
-            "description": details,
-            "success_url": redirect_url,
-            "fail_url": redirect_url,
+            "amount": minor_amount,
+            "currency": self.data.currency.value.lower(),
+            "name": details[: self._NAME_MAX_LEN],
+            "description": details[: self._DESCRIPTION_MAX_LEN],
+            "successUrl": redirect_url,
+            "failUrl": redirect_url,
+            "period": "onetime",
         }
 
-    def _get_payment_data(self, data: dict[str, Any], order_id: str) -> PaymentResultDto:
-        # Tribute responses commonly nest result under "data"; fall back to flat shape.
-        result = data.get("data") if isinstance(data.get("data"), dict) else data
-        payment_url = (
-            result.get("payment_url")
-            or result.get("url")
-            or result.get("checkout_url")
-        )
-        if not payment_url:
-            raise KeyError("Invalid response from Tribute API: missing payment URL")
+    def _get_payment_data(self, data: dict[str, Any]) -> PaymentResultDto:
+        order_uuid = data.get("id")
+        if not order_uuid:
+            raise KeyError("Invalid response from Tribute API: missing 'id'")
 
-        return PaymentResultDto(id=UUID(order_id), url=str(payment_url))
+        payment_url = data.get("webPaymentUrl") or data.get("webappPaymentUrl")
+        if not payment_url:
+            raise KeyError(
+                "Invalid response from Tribute API: missing 'webPaymentUrl'/'webappPaymentUrl'"
+            )
+
+        return PaymentResultDto(id=UUID(str(order_uuid)), url=str(payment_url))
 
     def _verify_webhook(self, request: Request, raw_body: bytes) -> bool:
-        signature = request.headers.get(self.SIGNATURE_HEADER) or request.headers.get(
-            "X-Signature"
-        )
+        signature = request.headers.get(self.SIGNATURE_HEADER)
         if not signature:
             logger.warning(f"Webhook is missing '{self.SIGNATURE_HEADER}' header")
             return False
 
-        webhook_secret = self.data.settings.webhook_secret  # type: ignore[union-attr]
-        if not webhook_secret:
-            logger.warning("Tribute webhook_secret is not configured")
-            return False
-
-        secret = webhook_secret.get_secret_value().encode()
-        expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+        api_key = self.data.settings.api_key.get_secret_value()  # type: ignore[union-attr]
+        expected = hmac.new(api_key.encode(), raw_body, hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected, signature):
             logger.warning("Invalid Tribute webhook signature")

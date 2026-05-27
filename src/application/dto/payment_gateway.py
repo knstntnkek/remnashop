@@ -153,7 +153,6 @@ class WataGatewaySettingsDto(GatewaySettingsDto):
 class TributeGatewaySettingsDto(GatewaySettingsDto):
     type: Literal[PaymentGatewayType.TRIBUTE] = PaymentGatewayType.TRIBUTE
     api_key: Optional[SecretStr] = None
-    webhook_secret: Optional[SecretStr] = None
 
 
 AnyGatewaySettingsDto = Union[
